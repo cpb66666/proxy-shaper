@@ -173,6 +173,10 @@ while True:
         oldest_b = history[ip][0][1]
         delta_b = total_b - oldest_b
 
+        if delta_b < 0:
+            history[ip] = [(now, total_b)]
+            delta_b = 0
+            
         # 触发限速
         if delta_b >= threshold_bytes and ip not in penalties:
             if free_class_ids:
