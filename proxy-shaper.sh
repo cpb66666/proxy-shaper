@@ -49,12 +49,12 @@ setup_network() {
     [ -z "$IFACE" ] && { echo "错误: 未找到有效出网网卡"; exit 1; }
     SSH_PORTS=$(detect_ssh_ports)
 
-    # 1. 初始化 tc HTB 根队列（默认通道 1:1 为全速 1000M，不限制正常峰值）
+    # 1. 初始化 tc HTB 根队列
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: htb default 1
     tc class add dev "$IFACE" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
 
-    # 2. 初始化 nftables 统计表
+    # 2. 初始化 nftables 统计表（增加 timeout 属性）
     nft delete table ip proxy_shaper 2>/dev/null || true
     
     local ssh_port_rules=""
@@ -67,7 +67,8 @@ setup_network() {
 table ip proxy_shaper {
     set client_traffic {
         type ipv4_addr
-        flags dynamic
+        flags dynamic, timeout
+        timeout 5m
         counter
     }
     chain prerouting {
@@ -75,13 +76,13 @@ table ip proxy_shaper {
         ip saddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
         ct state new fib daddr type local ct mark set 0x99;
-        ct mark 0x99 update @client_traffic { ip saddr counter };
+        ct mark 0x99 update @client_traffic { ip saddr timeout 5m counter };
     }
     chain postrouting {
         type filter hook postrouting priority mangle; policy accept;
         ip daddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
-        ct mark 0x99 update @client_traffic { ip daddr counter };
+        ct mark 0x99 update @client_traffic { ip daddr timeout 5m counter };
     }
 }
 EOF
@@ -127,7 +128,7 @@ def get_traffic():
     if res.returncode != 0:
         return {}
     data = {}
-    pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)\s+counter\s+packets\s+\d+\s+bytes\s+(\d+)')
+    pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)(?:[^\n]*?)counter\s+packets\s+\d+\s+bytes\s+(\d+)')
     for match in pattern.finditer(res.stdout):
         ip = match.group(1)
         b = int(match.group(2))
@@ -181,15 +182,19 @@ while True:
 
         is_penalized = ip in penalties
         rem = int(penalties[ip]["until"] - now) if is_penalized else 0
-        status_list.append({
-            "ip": ip,
-            "window_mb": round(delta_b / 1024 / 1024, 2),
-            "is_penalized": is_penalized,
-            "remaining_sec": rem
-        })
+        
+        # 仅将有实际流量（>= 0.05MB）或当前正在被限速的 IP 写入展示文件
+        mb_delta = round(delta_b / 1024 / 1024, 2)
+        if mb_delta >= 0.05 or is_penalized:
+            status_list.append({
+                "ip": ip,
+                "window_mb": mb_delta,
+                "is_penalized": is_penalized,
+                "remaining_sec": rem
+            })
 
-    # 清理非活跃 IP 记录 (超过 20 分钟无数据且未被限速)
-    inactive_ips = [ip for ip in history if ip not in current_traffic and ip not in penalties]
+    # 3. 及时清理在 nftables 中已超时被销毁且不在惩罚名单中的 IP 历史
+    inactive_ips = [ip for ip in list(history.keys()) if ip not in current_traffic and ip not in penalties]
     for ip in inactive_ips:
         del history[ip]
 
@@ -213,7 +218,7 @@ PYEOF
 
 show_status() {
     if [ ! -f "$STATUS_FILE" ]; then
-        echo "限速监控服务正在启动中或暂无流量数据，请等待 1 分钟后重试。"
+        echo "限速监控服务正在启动中或暂无活跃流量数据，请等待 1 分钟后重试。"
         exit 0
     fi
     python3 - << 'PYEOF'
@@ -234,7 +239,7 @@ print("-" * 80)
 
 clients = data.get("clients", [])
 if not clients:
-    print("当前暂无连接记录。")
+    print("当前暂无活跃连接或所有扫描探测流量均低于 0.05MB。")
 else:
     for c in clients:
         status_str = f"已限速 ({data['penalty_speed']})" if c["is_penalized"] else "正常 (全速)"
