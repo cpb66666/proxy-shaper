@@ -7,7 +7,7 @@ STATUS_FILE="/run/proxy-shaper-status.json"
 CHECK_INTERVAL=60          # 检查频率：每 1 分钟 (60秒)
 WINDOW_MINUTES=5            # 统计窗口：向前滚动 5 分钟
 THRESHOLD_MB=400            # 触发阈值：400 MB
-PENALTY_SPEED="10mbit"      # 每个受罚 IP 的独立限速上限：10 Mbps
+PENALTY_SPEED="10mbit"      # 每个受罚 IP 独立上限：10 Mbps
 PENALTY_HOURS=1             # 限速时长：1 小时
 
 if [ -f "$CONFIG_FILE" ]; then
@@ -49,26 +49,20 @@ setup_network() {
     [ -z "$IFACE" ] && { echo "错误: 未找到有效出网网卡"; exit 1; }
     SSH_PORTS=$(detect_ssh_ports)
 
-    # 1. 初始化 tc HTB 队列与独立限速桶 (256个独立槽位)
+    # 1. 初始化 tc HTB 根队列
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: htb default 1
+    # 默认正常通道 1:1 (全速 1000M)
     tc class add dev "$IFACE" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
 
-    for i in $(seq 0 255); do
-        local cid=$((100 + i))
-        local mark_hex=$(printf "0x%x" $cid)
-        tc class add dev "$IFACE" parent 1: classid "1:$cid" htb rate 2mbit ceil "$PENALTY_SPEED"
-        tc qdisc add dev "$IFACE" parent "1:$cid" handle "$cid:" fq_codel
-        tc filter add dev "$IFACE" parent 1:0 protocol ip prio 1 handle "$mark_hex" fw flowid "1:$cid"
-    done
-
-    # 2. 初始化 nftables 统计与打标表
+    # 2. 初始化 nftables 统计表
     nft delete table ip proxy_shaper 2>/dev/null || true
 
-    local ssh_port_rules=""
+    # 解析放行端口
+    local ssh_rules=""
     IFS=',' read -ra P_ARR <<< "$SSH_PORTS"
     for p in "${P_ARR[@]}"; do
-        [ -n "$p" ] && ssh_port_rules="${ssh_port_rules}tcp dport $p return; tcp sport $p return; "
+        [ -n "$p" ] && ssh_rules="${ssh_rules}tcp dport $p return; tcp sport $p return; "
     done
 
     nft -f - <<EOF
@@ -79,22 +73,19 @@ table ip proxy_shaper {
         timeout 30m
         counter
     }
-    set penalty_set {
-        type ipv4_addr
-        flags dynamic
-    }
+
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-        ip saddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
-        $ssh_port_rules
-        update @client_traffic { ip saddr timeout 30m counter }
+        ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
+        $ssh_rules
+        update @client_traffic { ip saddr counter }
     }
+
     chain postrouting {
         type filter hook postrouting priority mangle; policy accept;
-        ip daddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
-        $ssh_port_rules
-        update @client_traffic { ip daddr timeout 30m counter }
-        ip daddr @penalty_set meta mark set (jhash ip daddr mod 256) + 100
+        ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
+        $ssh_rules
+        update @client_traffic { ip daddr counter }
     }
 }
 EOF
@@ -102,7 +93,7 @@ EOF
 
 clean_network() {
     IFACE=$(detect_interface)
-    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    [ -n "$IFACE" ] && tc qdisc del dev "$IFACE" root 2>/dev/null || true
     nft delete table ip proxy_shaper 2>/dev/null || true
     rm -f "$STATUS_FILE"
 }
@@ -128,22 +119,22 @@ penalty_speed = os.environ.get("PENALTY_SPEED", "10mbit")
 penalty_duration = int(os.environ.get("PENALTY_HOURS", 1)) * 3600
 status_file = os.environ.get("STATUS_FILE", "/run/proxy-shaper-status.json")
 
-history = {}
-penalties = {}
-last_sample = {}
+history = {}         # ip -> list of [timestamp, bytes]
+penalties = {}       # ip -> {"until": expire_ts, "class_id": int}
+last_sample = {}     # ip -> [timestamp, bytes]
+free_class_ids = set(range(100, 2000)) # 独占通道池
 
 def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 def get_traffic():
-    # 方案 1：优先采用 JSON 解析，精准兼容 element 与 set 双层结构
-    res = run_cmd("nft -j list set ip proxy_shaper client_traffic 2>/dev/null")
     data = {}
+    # 优先使用 JSON 解析
+    res = run_cmd("nft -j list set ip proxy_shaper client_traffic 2>/dev/null")
     if res.returncode == 0 and res.stdout.strip():
         try:
             nft_json = json.loads(res.stdout)
             for item in nft_json.get("nftables", []):
-                # 兼容 element 节点以及部分版本的 set 节点
                 container = item.get("element") or item.get("set")
                 if container:
                     elements = container.get("elem", [])
@@ -151,11 +142,11 @@ def get_traffic():
                         ip = None
                         b = 0
                         if isinstance(elem, dict):
-                            # 处理嵌套 elem
                             inner = elem.get("elem", elem)
-                            ip = inner.get("val")
-                            # 提取 counter
-                            ctr = inner.get("counter") or elem.get("counter")
+                            ip = inner.get("val") if isinstance(inner, dict) else None
+                            ctr = inner.get("counter") if isinstance(inner, dict) else None
+                            if not ctr and isinstance(elem, dict):
+                                ctr = elem.get("counter")
                             if ctr and isinstance(ctr, dict):
                                 b = ctr.get("bytes", 0)
                         elif isinstance(elem, str):
@@ -165,38 +156,34 @@ def get_traffic():
         except Exception:
             data = {}
 
-    # 方案 2：如果 JSON 解析结果为空，自动无缝降级到正则文本解析，确保 100% 捕获数据
+    # 兜底：正则文本提取，100% 容错防空
     if not data:
         text_res = run_cmd("nft list set ip proxy_shaper client_traffic 2>/dev/null")
-        if text_res.returncode == 0:
-            # 匹配形如: 1.2.3.4 timeout 30m counter packets 100 bytes 1048576
-            pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+).*?bytes\s+(\d+)')
+        if text_res.returncode == 0 and text_res.stdout.strip():
+            pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)[^\n]*?bytes\s+(\d+)')
             for match in pattern.finditer(text_res.stdout):
                 data[match.group(1)] = int(match.group(2))
 
     return data
 
-def sync_nft_penalty(ip_list):
-    run_cmd("nft flush set ip proxy_shaper penalty_set 2>/dev/null")
-    if ip_list:
-        elements = ",".join(ip_list)
-        run_cmd(f"nft add element ip proxy_shaper penalty_set {{ {elements} }} 2>/dev/null")
-
 while True:
     now = time.time()
     current_traffic = get_traffic()
     status_list = []
-    penalties_changed = False
 
-    # 1. 检查并清理过期的惩罚 IP
-    expired_ips = [ip for ip, exp_time in penalties.items() if now >= exp_time]
+    # 1. 检查并清理过期的限速 IP，解封并销毁其专属队列
+    expired_ips = [ip for ip, info in penalties.items() if now >= info["until"]]
     for ip in expired_ips:
+        cid = penalties[ip]["class_id"]
+        run_cmd(f"tc filter del dev {iface} parent 1:0 protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{cid} 2>/dev/null")
+        run_cmd(f"tc qdisc del dev {iface} parent 1:{cid} 2>/dev/null")
+        run_cmd(f"tc class del dev {iface} parent 1: classid 1:{cid} 2>/dev/null")
+        free_class_ids.add(cid)
         del penalties[ip]
-        penalties_changed = True
         if ip in current_traffic:
             history[ip] = [[now, current_traffic[ip]]]
 
-    # 2. 遍历流量，滚动窗口计算
+    # 2. 遍历统计流量，滚动窗口计算
     for ip, total_b in current_traffic.items():
         cur_rate_mbps = 0.0
         if ip in last_sample:
@@ -206,30 +193,32 @@ while True:
                 cur_rate_mbps = round((db * 8) / (dt * 1000 * 1000), 2)
         last_sample[ip] = [now, total_b]
 
+        # 首次发现 IP 时，将上一采样点设为 0，确保首个周期的增量即刻呈现
         if ip not in history:
-            history[ip] = [[now, total_b]]
+            history[ip] = [[now - check_interval, 0], [now, total_b]]
         else:
             history[ip].append([now, total_b])
 
         cutoff = now - window_sec
         history[ip] = [pt for pt in history[ip] if pt[0] >= cutoff]
 
-        if len(history[ip]) == 1:
-            delta_b = 0
-        else:
-            oldest_b = history[ip][0][1]
-            delta_b = max(0, total_b - oldest_b)
+        oldest_b = history[ip][0][1]
+        delta_b = max(0, total_b - oldest_b)
 
-        # 触发惩罚判定
+        # 触发限速：分配独占 classid 并下发独立 tc HTB 槽位
         if delta_b >= threshold_bytes and ip not in penalties:
-            penalties[ip] = now + penalty_duration
-            penalties_changed = True
+            if free_class_ids:
+                cid = free_class_ids.pop()
+                penalties[ip] = {"until": now + penalty_duration, "class_id": cid}
+                run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate 2mbit ceil {penalty_speed}")
+                run_cmd(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: fq_codel")
+                run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{cid}")
 
         is_penalized = ip in penalties
-        rem = int(penalties[ip] - now) if is_penalized else 0
+        rem = int(penalties[ip]["until"] - now) if is_penalized else 0
         window_mb = round(delta_b / 1024 / 1024, 2)
 
-        # 调整展示过滤阈值至 0.05MB，方便刚跑流量时立即看到效果
+        # 5 分钟流量 >= 0.05MB 或处于限速中的 IP 均予展示
         if window_mb >= 0.05 or is_penalized:
             status_list.append({
                 "ip": ip,
@@ -239,12 +228,9 @@ while True:
                 "remaining_sec": rem
             })
 
-    if penalties_changed:
-        sync_nft_penalty(list(penalties.keys()))
-
     status_list.sort(key=lambda x: x["window_mb"], reverse=True)
 
-    # 3. 内存回收
+    # 3. 内存回收：清理内核中已超时回收且不在惩罚名单中的 IP 缓存
     current_ips = set(current_traffic.keys())
     inactive_ips = [ip for ip in list(history.keys()) if ip not in current_ips and ip not in penalties]
     for ip in inactive_ips:
@@ -305,7 +291,6 @@ PYEOF
 
 manual_reset() {
     echo "正在重置所有限速并清空历史状态..."
-    nft flush set ip proxy_shaper penalty_set 2>/dev/null || true
     systemctl restart proxy-shaper.service
     echo "全部 IP 已恢复正常全速，统计窗口已重置！"
 }
