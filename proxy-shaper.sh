@@ -58,7 +58,6 @@ setup_network() {
     # 2. 初始化 nftables 统计表
     nft delete table ip proxy_shaper 2>/dev/null || true
 
-    # 解析放行端口
     local ssh_rules=""
     IFS=',' read -ra P_ARR <<< "$SSH_PORTS"
     for p in "${P_ARR[@]}"; do
@@ -205,12 +204,12 @@ while True:
         oldest_b = history[ip][0][1]
         delta_b = max(0, total_b - oldest_b)
 
-        # 触发限速：分配独占 classid 并下发独立 tc HTB 槽位
+        # 触发限速：分配独占 classid，并使用完全等于 penalty_speed 的保障速率 + 峰值速率
         if delta_b >= threshold_bytes and ip not in penalties:
             if free_class_ids:
                 cid = free_class_ids.pop()
                 penalties[ip] = {"until": now + penalty_duration, "class_id": cid}
-                run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate 2mbit ceil {penalty_speed}")
+                run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate {penalty_speed} ceil {penalty_speed} burst 15k")
                 run_cmd(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: fq_codel")
                 run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{cid}")
 
