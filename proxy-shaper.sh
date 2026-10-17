@@ -52,10 +52,8 @@ setup_network() {
     # 1. 初始化 tc HTB 队列与独立限速桶 (256个独立槽位)
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: htb default 1
-    # 默认通道 1:1 (正常流量全速 1000M)
     tc class add dev "$IFACE" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
 
-    # 创建 256 个独立的惩罚通道 (1:100 ~ 1:355)，每个通道独占 PENALTY_SPEED
     for i in $(seq 0 255); do
         local cid=$((100 + i))
         local mark_hex=$(printf "0x%x" $cid)
@@ -96,7 +94,6 @@ table ip proxy_shaper {
         ip daddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
         update @client_traffic { ip daddr timeout 30m counter }
-        # 命中受罚列表：基于 IP 哈希映射到 100~355 之间的标记，导入独立限速通道
         ip daddr @penalty_set meta mark set (jhash ip daddr mod 256) + 100
     }
 }
@@ -121,7 +118,7 @@ run_daemon() {
     export STATUS_FILE="$STATUS_FILE"
 
     exec python3 -u - << 'PYEOF'
-import os, sys, time, json, subprocess
+import os, sys, time, json, subprocess, re
 
 iface = os.environ.get("IFACE", "eth0")
 check_interval = int(os.environ.get("CHECK_INTERVAL", 60))
@@ -131,34 +128,52 @@ penalty_speed = os.environ.get("PENALTY_SPEED", "10mbit")
 penalty_duration = int(os.environ.get("PENALTY_HOURS", 1)) * 3600
 status_file = os.environ.get("STATUS_FILE", "/run/proxy-shaper-status.json")
 
-history = {}     # ip -> list of [timestamp, bytes]
-penalties = {}   # ip -> expire_timestamp
-last_sample = {} # ip -> [last_time, last_bytes]
+history = {}
+penalties = {}
+last_sample = {}
 
 def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 def get_traffic():
-    # 使用 nft 原生 JSON 解析，极大提高解析性能并降低 CPU 开销
+    # 方案 1：优先采用 JSON 解析，精准兼容 element 与 set 双层结构
     res = run_cmd("nft -j list set ip proxy_shaper client_traffic 2>/dev/null")
-    if res.returncode != 0 or not res.stdout.strip():
-        return {}
     data = {}
-    try:
-        nft_json = json.loads(res.stdout)
-        for item in nft_json.get("nftables", []):
-            if "set" in item:
-                elements = item["set"].get("elem", [])
-                for elem in elements:
-                    if isinstance(elem, dict) and "elem" in elem:
-                        val = elem["elem"].get("val")
-                        b = elem["elem"].get("counter", {}).get("bytes", 0)
-                        if val:
-                            data[val] = b
-                    elif isinstance(elem, str):
-                        data[elem] = 0
-    except Exception:
-        pass
+    if res.returncode == 0 and res.stdout.strip():
+        try:
+            nft_json = json.loads(res.stdout)
+            for item in nft_json.get("nftables", []):
+                # 兼容 element 节点以及部分版本的 set 节点
+                container = item.get("element") or item.get("set")
+                if container:
+                    elements = container.get("elem", [])
+                    for elem in elements:
+                        ip = None
+                        b = 0
+                        if isinstance(elem, dict):
+                            # 处理嵌套 elem
+                            inner = elem.get("elem", elem)
+                            ip = inner.get("val")
+                            # 提取 counter
+                            ctr = inner.get("counter") or elem.get("counter")
+                            if ctr and isinstance(ctr, dict):
+                                b = ctr.get("bytes", 0)
+                        elif isinstance(elem, str):
+                            ip = elem
+                        if ip:
+                            data[ip] = b
+        except Exception:
+            data = {}
+
+    # 方案 2：如果 JSON 解析结果为空，自动无缝降级到正则文本解析，确保 100% 捕获数据
+    if not data:
+        text_res = run_cmd("nft list set ip proxy_shaper client_traffic 2>/dev/null")
+        if text_res.returncode == 0:
+            # 匹配形如: 1.2.3.4 timeout 30m counter packets 100 bytes 1048576
+            pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+).*?bytes\s+(\d+)')
+            for match in pattern.finditer(text_res.stdout):
+                data[match.group(1)] = int(match.group(2))
+
     return data
 
 def sync_nft_penalty(ip_list):
@@ -214,7 +229,8 @@ while True:
         rem = int(penalties[ip] - now) if is_penalized else 0
         window_mb = round(delta_b / 1024 / 1024, 2)
 
-        if window_mb >= 1.0 or is_penalized:
+        # 调整展示过滤阈值至 0.05MB，方便刚跑流量时立即看到效果
+        if window_mb >= 0.05 or is_penalized:
             status_list.append({
                 "ip": ip,
                 "window_mb": window_mb,
@@ -223,14 +239,12 @@ while True:
                 "remaining_sec": rem
             })
 
-    # 同步状态到 nftables 集合
     if penalties_changed:
         sync_nft_penalty(list(penalties.keys()))
 
-    # 按 5 分钟流量倒序排序
     status_list.sort(key=lambda x: x["window_mb"], reverse=True)
 
-    # 3. 内存回收：清理由于内核 30m timeout 超时已不在当前流量统计中且未受罚的 IP
+    # 3. 内存回收
     current_ips = set(current_traffic.keys())
     inactive_ips = [ip for ip in list(history.keys()) if ip not in current_ips and ip not in penalties]
     for ip in inactive_ips:
@@ -278,7 +292,7 @@ print("-" * 88)
 
 clients = data.get("clients", [])
 if not clients:
-    print("当前暂无活跃流量记录 (已自动过滤 < 1.0 MB 的空闲 IP)。")
+    print("当前暂无活跃流量记录 (已自动过滤 < 0.05 MB 的空闲 IP)。")
 else:
     for c in clients:
         status_str = f"已限速 ({data['penalty_speed']})" if c["is_penalized"] else "正常 (全速)"
