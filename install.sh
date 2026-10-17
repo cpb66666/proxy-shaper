@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 # ================= GitHub 配置 =================
 GITHUB_USER="cpb66666"
@@ -30,6 +29,12 @@ install_dependencies() {
 
 pull_shaper_script() {
     echo "获取核心控制脚本..."
+    # 切换或覆盖前先停止旧服务，防止旧 tc 规则与新限速参数冲突
+    if [ -f "$BIN_FILE" ]; then
+        systemctl stop proxy-shaper.service 2>/dev/null || true
+        "$BIN_FILE" stop 2>/dev/null || true
+    fi
+
     if [ -f "./proxy-shaper.sh" ]; then
         cp ./proxy-shaper.sh "$BIN_FILE"
     else
@@ -66,7 +71,7 @@ install_plan1() {
     echo " - 检查频率: 每 1 分钟"
     echo " - 统计窗口: 向前滚动 5 分钟"
     echo " - 触发阈值: 400 MB / 5 分钟 (上行+下行合并)"
-    echo " - 触发限速: 10 Mbps"
+    echo " - 触发限速: 10 Mbps (单 IP 独占上限)"
     echo " - 限速时长: 1 小时 (到期恢复全速继续滚动)"
     echo "--------------------------------------------------"
     install_dependencies
@@ -90,7 +95,7 @@ install_plan2() {
     echo " - 检查频率: 每 1 分钟"
     echo " - 统计窗口: 向前滚动 5 分钟"
     echo " - 触发阈值: 800 MB / 5 分钟 (上行+下行合并)"
-    echo " - 触发限速: 20 Mbps"
+    echo " - 触发限速: 20 Mbps (单 IP 独占上限)"
     echo " - 限速时长: 1 小时 (到期恢复全速继续滚动)"
     echo "--------------------------------------------------"
     install_dependencies
@@ -113,10 +118,10 @@ install_custom() {
     echo " 配置自定义滚动限速参数 (直接回车保留默认值)"
     echo "--------------------------------------------------"
     
-    read -p "1. 触发阈值流量 (单位: MB / 5分钟) [默认 400]: " in_mb
+    read -p "1. 触发阈值流量 (单位: MB / 窗口期) [默认 400]: " in_mb
     in_mb=${in_mb:-400}
 
-    read -p "2. 触发惩罚后限速带宽 (单位: Mbps) [默认 10]: " in_speed
+    read -p "2. 触发惩罚后每个 IP 独立限速 (单位: Mbps) [默认 10]: " in_speed
     in_speed=${in_speed:-10}
 
     read -p "3. 限速持续时长 (单位: 小时) [默认 1]: " in_hours
@@ -126,7 +131,7 @@ install_custom() {
     in_win=${in_win:-5}
 
     echo "--------------------------------------------------"
-    echo "确认配置: 滚动 ${in_win}分钟 | 阈值 ${in_mb}MB | 限速 ${in_speed}Mbps | 惩罚 ${in_hours}小时"
+    echo "确认配置: 滚动 ${in_win}分钟 | 阈值 ${in_mb}MB | 独立限速 ${in_speed}Mbps | 惩罚 ${in_hours}小时"
     echo "--------------------------------------------------"
 
     install_dependencies
@@ -172,31 +177,38 @@ manual_reset() {
     fi
 }
 
-show_menu() {
-    clear
-    echo "=================================================="
-    echo "        Linux 单 IP 滚动窗口动态限速管理面板        "
-    echo "=================================================="
-    echo " 1. 安装/切换 默认方案 1 (10M基准: 5分钟超400M限速10M 1小时)"
-    echo " 2. 安装/切换 默认方案 2 (20M基准: 5分钟超800M限速20M 1小时)"
-    echo " 3. 安装/切换 自定义参数 (自定义窗口/阈值/限速/时长)"
-    echo " 4. 查看当前实时流量统计与被限速 IP"
-    echo " 5. 手动重置所有处于惩罚状态的 IP"
-    echo " 6. 卸载限速服务 (清除所有规则恢复原速)"
-    echo " 0. 退出菜单"
-    echo "=================================================="
-    read -p "请输入选项 [0-6]: " choice
+pause() {
+    echo ""
+    read -p "按回车键继续..." dummy
+}
 
-    case "$choice" in
-        1) install_plan1 ;;
-        2) install_plan2 ;;
-        3) install_custom ;;
-        4) show_status ;;
-        5) manual_reset ;;
-        6) uninstall ;;
-        0) exit 0 ;;
-        *) echo "无效选项，请输入 0-6" ;;
-    esac
+show_menu() {
+    while true; do
+        clear
+        echo "=================================================="
+        echo "        Linux 单 IP 滚动窗口动态限速管理面板       "
+        echo "=================================================="
+        echo " 1. 安装/切换 默认方案 1 (5分钟超400M 独立限速10M 1小时)"
+        echo " 2. 安装/切换 默认方案 2 (5分钟超800M 独立限速20M 1小时)"
+        echo " 3. 安装/切换 自定义参数 (自定义窗口/阈值/限速/时长)"
+        echo " 4. 查看当前实时流量统计与被限速 IP"
+        echo " 5. 手动重置所有处于惩罚状态的 IP"
+        echo " 6. 卸载限速服务 (清除所有规则恢复原速)"
+        echo " 0. 退出菜单"
+        echo "=================================================="
+        read -p "请输入选项 [0-6]: " choice
+
+        case "$choice" in
+            1) install_plan1; pause ;;
+            2) install_plan2; pause ;;
+            3) install_custom; pause ;;
+            4) show_status; pause ;;
+            5) manual_reset; pause ;;
+            6) uninstall; pause ;;
+            0) exit 0 ;;
+            *) echo "无效选项，请输入 0-6"; sleep 1 ;;
+        esac
+    done
 }
 
 show_menu
