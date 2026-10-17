@@ -2,20 +2,21 @@
 
 CONFIG_FILE="/etc/proxy-shaper.conf"
 STATUS_FILE="/run/proxy-shaper-status.json"
+IFB_DEV="ifb0"
 
 # 默认配置
 CHECK_INTERVAL=60          # 检查频率：每 1 分钟 (60秒)
-WINDOW_MINUTES=5            # 统计窗口：向前滚动 5 分钟
-THRESHOLD_MB=400            # 触发阈值：400 MB
-PENALTY_SPEED="10mbit"      # 每个受罚 IP 独立上限：10 Mbps
-PENALTY_HOURS=1             # 限速时长：1 小时
+WINDOW_MINUTES=5           # 统计窗口：向前滚动 5 分钟
+THRESHOLD_MB=400           # 触发阈值：400 MB
+PENALTY_SPEED="10mbit"     # 每个受罚 IP 独立上限：10 Mbps
+PENALTY_HOURS=1            # 限速时长：1 小时
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
 
 detect_interface() {
-    local candidates=($(ip -o link show | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker[0-9]*|br-[0-9a-f]+|veth.*|wg.*|tun[0-9]*|tap[0-9]*)$'))
+    local candidates=($(ip -o link show | awk -F': ' '{print $2}' | grep -Ev '^(lo|ifb[0-9]*|docker[0-9]*|br-[0-9a-f]+|veth.*|wg.*|tun[0-9]*|tap[0-9]*)$'))
     if [ ${#candidates[@]} -le 1 ]; then
         echo "${candidates[0]:-$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)}"
         return
@@ -49,19 +50,37 @@ setup_network() {
     [ -z "$IFACE" ] && { echo "错误: 未找到有效出网网卡"; exit 1; }
     SSH_PORTS=$(detect_ssh_ports)
 
-    # 1. 初始化 tc HTB 根队列
+    # 0. 关闭网卡硬件分载 (防止 50KB+ 巨型聚合包冲破 TC 令牌桶)
+    ethtool -K "$IFACE" tso off gso off gro off 2>/dev/null || true
+
+    # 1. 初始化物理网卡 tc HTB 根队列 (控制出站/客户端下载)
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: htb default 1
-    # 默认正常通道 1:1 (全速 1000M)
     tc class add dev "$IFACE" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
 
-    # 2. 初始化 nftables 统计表
+    # 2. 初始化 IFB 虚拟网卡队列 (控制入站/客户端上传)
+    modprobe ifb numifbs=1 2>/dev/null || true
+    ip link set dev "$IFB_DEV" up 2>/dev/null || true
+
+    tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
+    tc qdisc add dev "$IFACE" handle ffff: ingress
+    tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV"
+
+    tc qdisc del dev "$IFB_DEV" root 2>/dev/null || true
+    tc qdisc add dev "$IFB_DEV" root handle 1: htb default 1
+    tc class add dev "$IFB_DEV" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
+
+    # 3. 初始化 nftables 统计表 (基于 ct direction 仅统计外部连入的真实客户端 IP)
     nft delete table ip proxy_shaper 2>/dev/null || true
 
-    local ssh_rules=""
+    local ssh_in_rules=""
+    local ssh_out_rules=""
     IFS=',' read -ra P_ARR <<< "$SSH_PORTS"
     for p in "${P_ARR[@]}"; do
-        [ -n "$p" ] && ssh_rules="${ssh_rules}tcp dport $p return; tcp sport $p return; "
+        if [ -n "$p" ]; then
+            ssh_in_rules="${ssh_in_rules}tcp dport $p return; "
+            ssh_out_rules="${ssh_out_rules}tcp sport $p return; "
+        fi
     done
 
     nft -f - <<EOF
@@ -73,18 +92,18 @@ table ip proxy_shaper {
         counter
     }
 
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
+    chain input {
+        type filter hook input priority mangle; policy accept;
         ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
-        $ssh_rules
-        update @client_traffic { ip saddr counter }
+        $ssh_in_rules
+        ct direction original update @client_traffic { ip saddr counter }
     }
 
-    chain postrouting {
-        type filter hook postrouting priority mangle; policy accept;
+    chain output {
+        type filter hook output priority mangle; policy accept;
         ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
-        $ssh_rules
-        update @client_traffic { ip daddr counter }
+        $ssh_out_rules
+        ct direction reply update @client_traffic { ip daddr counter }
     }
 }
 EOF
@@ -92,7 +111,13 @@ EOF
 
 clean_network() {
     IFACE=$(detect_interface)
-    [ -n "$IFACE" ] && tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    if [ -n "$IFACE" ]; then
+        tc qdisc del dev "$IFACE" root 2>/dev/null || true
+        tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
+        ethtool -K "$IFACE" tso on gso on gro on 2>/dev/null || true
+    fi
+    tc qdisc del dev "$IFB_DEV" root 2>/dev/null || true
+    ip link set dev "$IFB_DEV" down 2>/dev/null || true
     nft delete table ip proxy_shaper 2>/dev/null || true
     rm -f "$STATUS_FILE"
 }
@@ -100,6 +125,7 @@ clean_network() {
 run_daemon() {
     setup_network
     export IFACE=$(detect_interface)
+    export IFB_DEV="$IFB_DEV"
     export CHECK_INTERVAL="$CHECK_INTERVAL"
     export WINDOW_MINUTES="$WINDOW_MINUTES"
     export THRESHOLD_MB="$THRESHOLD_MB"
@@ -111,6 +137,7 @@ run_daemon() {
 import os, sys, time, json, subprocess, re
 
 iface = os.environ.get("IFACE", "eth0")
+ifb_dev = os.environ.get("IFB_DEV", "ifb0")
 check_interval = int(os.environ.get("CHECK_INTERVAL", 60))
 window_sec = int(os.environ.get("WINDOW_MINUTES", 5)) * 60
 threshold_bytes = int(os.environ.get("THRESHOLD_MB", 400)) * 1024 * 1024
@@ -121,10 +148,34 @@ status_file = os.environ.get("STATUS_FILE", "/run/proxy-shaper-status.json")
 history = {}         # ip -> list of [timestamp, bytes]
 penalties = {}       # ip -> {"until": expire_ts, "class_id": int}
 last_sample = {}     # ip -> [timestamp, bytes]
-free_class_ids = set(range(100, 2000)) # 独占通道池
+free_class_ids = set(range(100, 2000)) # 独占通道池 (同时作为独立的 prio 编号)
 
 def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+def apply_tc_limit(ip, cid):
+    # 先清理可能残留的同编号规则
+    remove_tc_limit(cid)
+
+    # 1. 物理网卡 (控制客户端下载 Egress: 匹配目标地址 dst)
+    run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate {penalty_speed} ceil {penalty_speed} burst 15k cburst 15k")
+    run_cmd(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: fq_codel limit 1024")
+    run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio {cid} u32 match ip dst {ip}/32 flowid 1:{cid}")
+
+    # 2. IFB 虚拟网卡 (控制客户端上传 Ingress: 匹配源地址 src)
+    run_cmd(f"tc class add dev {ifb_dev} parent 1: classid 1:{cid} htb rate {penalty_speed} ceil {penalty_speed} burst 15k cburst 15k")
+    run_cmd(f"tc qdisc add dev {ifb_dev} parent 1:{cid} handle {cid}: fq_codel limit 1024")
+    run_cmd(f"tc filter add dev {ifb_dev} parent 1:0 protocol ip prio {cid} u32 match ip src {ip}/32 flowid 1:{cid}")
+
+def remove_tc_limit(cid):
+    # 按顺序卸载：先按独立 prio 删 filter -> 再删 qdisc -> 最后删 class
+    run_cmd(f"tc filter del dev {iface} parent 1:0 prio {cid} 2>/dev/null")
+    run_cmd(f"tc qdisc del dev {iface} parent 1:{cid} 2>/dev/null")
+    run_cmd(f"tc class del dev {iface} classid 1:{cid} 2>/dev/null")
+
+    run_cmd(f"tc filter del dev {ifb_dev} parent 1:0 prio {cid} 2>/dev/null")
+    run_cmd(f"tc qdisc del dev {ifb_dev} parent 1:{cid} 2>/dev/null")
+    run_cmd(f"tc class del dev {ifb_dev} classid 1:{cid} 2>/dev/null")
 
 def get_traffic():
     data = {}
@@ -170,12 +221,11 @@ while True:
     current_traffic = get_traffic()
     status_list = []
 
-# 1. 检查并清理过期的限速 IP，解封并销毁其专属队列
+    # 1. 检查并清理过期的限速 IP，解封并销毁其专属队列
     expired_ips = [ip for ip, info in penalties.items() if now >= info["until"]]
     for ip in expired_ips:
         cid = penalties[ip]["class_id"]
-        run_cmd(f"tc filter del dev {iface} parent 1:0 protocol ip prio 1 handle {cid} u32 2>/dev/null")
-        run_cmd(f"tc qdisc del dev {iface} parent 1:{cid} 2>/dev/null")
+        remove_tc_limit(cid)
         free_class_ids.add(cid)
         del penalties[ip]
         if ip in current_traffic:
@@ -203,14 +253,12 @@ while True:
         oldest_b = history[ip][0][1]
         delta_b = max(0, total_b - oldest_b)
 
-# 触发限速：分配独占 classid
+        # 触发限速：分配独占 classid 并下发双向规则
         if delta_b >= threshold_bytes and ip not in penalties:
             if free_class_ids:
                 cid = free_class_ids.pop()
                 penalties[ip] = {"until": now + penalty_duration, "class_id": cid}
-                run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate {penalty_speed} ceil {penalty_speed} burst 15k")
-                run_cmd(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: fq_codel")
-                run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio 1 handle {cid} u32 match ip dst {ip}/32 flowid 1:{cid}")
+                apply_tc_limit(ip, cid)
 
         is_penalized = ip in penalties
         rem = int(penalties[ip]["until"] - now) if is_penalized else 0
