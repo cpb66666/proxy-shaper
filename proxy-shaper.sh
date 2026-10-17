@@ -5,10 +5,10 @@ STATUS_FILE="/run/proxy-shaper-status.json"
 
 # 默认配置
 CHECK_INTERVAL=60          # 检查频率：每 1 分钟 (60秒)
-WINDOW_MINUTES=5           # 统计窗口：向前滚动 5 分钟
-THRESHOLD_MB=400           # 触发阈值：400 MB
-PENALTY_SPEED="10mbit"     # 触发后限速：10 Mbps
-PENALTY_HOURS=1            # 限速时长：1 小时
+WINDOW_MINUTES=5            # 统计窗口：向前滚动 5 分钟
+THRESHOLD_MB=400            # 触发阈值：400 MB
+PENALTY_SPEED="10mbit"      # 每个受罚 IP 的独立限速上限：10 Mbps
+PENALTY_HOURS=1             # 限速时长：1 小时
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
@@ -49,22 +49,24 @@ setup_network() {
     [ -z "$IFACE" ] && { echo "错误: 未找到有效出网网卡"; exit 1; }
     SSH_PORTS=$(detect_ssh_ports)
 
-    # 1. 初始化 tc HTB 队列
+    # 1. 初始化 tc HTB 队列与独立限速桶 (256个独立槽位)
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: htb default 1
-    # 默认通道 1:1 (未受限，全速 1000M)
+    # 默认通道 1:1 (正常流量全速 1000M)
     tc class add dev "$IFACE" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
 
-    # 惩罚通道 1:20 (受罚流量，硬顶至 PENALTY_SPEED)
-    tc class add dev "$IFACE" parent 1: classid 1:20 htb rate 2mbit ceil "$PENALTY_SPEED"
-    tc qdisc add dev "$IFACE" parent 1:20 handle 20: fq_codel
-
-    # 绑定 fwmark 0x20 到惩罚通道 1:20
-    tc filter add dev "$IFACE" parent 1:0 protocol ip prio 1 handle 0x20 fw flowid 1:20
+    # 创建 256 个独立的惩罚通道 (1:100 ~ 1:355)，每个通道独占 PENALTY_SPEED
+    for i in $(seq 0 255); do
+        local cid=$((100 + i))
+        local mark_hex=$(printf "0x%x" $cid)
+        tc class add dev "$IFACE" parent 1: classid "1:$cid" htb rate 2mbit ceil "$PENALTY_SPEED"
+        tc qdisc add dev "$IFACE" parent "1:$cid" handle "$cid:" fq_codel
+        tc filter add dev "$IFACE" parent 1:0 protocol ip prio 1 handle "$mark_hex" fw flowid "1:$cid"
+    done
 
     # 2. 初始化 nftables 统计与打标表
     nft delete table ip proxy_shaper 2>/dev/null || true
-    
+
     local ssh_port_rules=""
     IFS=',' read -ra P_ARR <<< "$SSH_PORTS"
     for p in "${P_ARR[@]}"; do
@@ -75,7 +77,8 @@ setup_network() {
 table ip proxy_shaper {
     set client_traffic {
         type ipv4_addr
-        flags dynamic
+        flags dynamic, timeout
+        timeout 30m
         counter
     }
     set penalty_set {
@@ -86,14 +89,15 @@ table ip proxy_shaper {
         type filter hook prerouting priority mangle; policy accept;
         ip saddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
-        update @client_traffic { ip saddr counter }
+        update @client_traffic { ip saddr timeout 30m counter }
     }
     chain postrouting {
         type filter hook postrouting priority mangle; policy accept;
         ip daddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
-        update @client_traffic { ip daddr counter }
-        ip daddr @penalty_set meta mark set 0x20
+        update @client_traffic { ip daddr timeout 30m counter }
+        # 命中受罚列表：基于 IP 哈希映射到 100~355 之间的标记，导入独立限速通道
+        ip daddr @penalty_set meta mark set (jhash ip daddr mod 256) + 100
     }
 }
 EOF
@@ -117,7 +121,7 @@ run_daemon() {
     export STATUS_FILE="$STATUS_FILE"
 
     exec python3 -u - << 'PYEOF'
-import os, sys, time, json, subprocess, re
+import os, sys, time, json, subprocess
 
 iface = os.environ.get("IFACE", "eth0")
 check_interval = int(os.environ.get("CHECK_INTERVAL", 60))
@@ -135,13 +139,26 @@ def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 def get_traffic():
-    res = run_cmd("nft list set ip proxy_shaper client_traffic 2>/dev/null")
-    if res.returncode != 0:
+    # 使用 nft 原生 JSON 解析，极大提高解析性能并降低 CPU 开销
+    res = run_cmd("nft -j list set ip proxy_shaper client_traffic 2>/dev/null")
+    if res.returncode != 0 or not res.stdout.strip():
         return {}
     data = {}
-    pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)\s+counter\s+packets\s+\d+\s+bytes\s+(\d+)')
-    for match in pattern.finditer(res.stdout):
-        data[match.group(1)] = int(match.group(2))
+    try:
+        nft_json = json.loads(res.stdout)
+        for item in nft_json.get("nftables", []):
+            if "set" in item:
+                elements = item["set"].get("elem", [])
+                for elem in elements:
+                    if isinstance(elem, dict) and "elem" in elem:
+                        val = elem["elem"].get("val")
+                        b = elem["elem"].get("counter", {}).get("bytes", 0)
+                        if val:
+                            data[val] = b
+                    elif isinstance(elem, str):
+                        data[elem] = 0
+    except Exception:
+        pass
     return data
 
 def sync_nft_penalty(ip_list):
@@ -197,7 +214,6 @@ while True:
         rem = int(penalties[ip] - now) if is_penalized else 0
         window_mb = round(delta_b / 1024 / 1024, 2)
 
-        # 过滤规则：只有 5 分钟流量 >= 1.0 MB 或处于受罚状态时才加入面板
         if window_mb >= 1.0 or is_penalized:
             status_list.append({
                 "ip": ip,
@@ -214,14 +230,9 @@ while True:
     # 按 5 分钟流量倒序排序
     status_list.sort(key=lambda x: x["window_mb"], reverse=True)
 
-    # 3. 内存回收：清理超 20 分钟无流量增长且未受罚的非活跃 IP
-    inactive_ips = []
-    for ip, pts in list(history.items()):
-        if ip not in penalties:
-            # 最新采样点距今超 20 分钟，或 20 分钟内流量增长为 0
-            if pts and (now - pts[-1][0] > 1200 or (len(pts) > 1 and pts[-1][1] == pts[0][1] and now - pts[0][0] > 1200)):
-                inactive_ips.append(ip)
-
+    # 3. 内存回收：清理由于内核 30m timeout 超时已不在当前流量统计中且未受罚的 IP
+    current_ips = set(current_traffic.keys())
+    inactive_ips = [ip for ip in list(history.keys()) if ip not in current_ips and ip not in penalties]
     for ip in inactive_ips:
         history.pop(ip, None)
         last_sample.pop(ip, None)
@@ -260,7 +271,7 @@ except Exception:
     exit(0)
 
 print("=" * 88)
-print(f" 网卡: {data['iface']} | 统计窗口: {data['window_min']}分钟 | 触发阈值: {data['threshold_mb']}MB | 限速: {data['penalty_speed']} | 惩罚时长: {data['penalty_hours']}小时")
+print(f" 网卡: {data['iface']} | 统计窗口: {data['window_min']}分钟 | 触发阈值: {data['threshold_mb']}MB | 独立限速: {data['penalty_speed']} | 惩罚时长: {data['penalty_hours']}小时")
 print("=" * 88)
 print(f"{'客户端 IP':<18} {'5分钟总流量':<16} {'实时速率':<14} {'当前状态':<18} {'剩余限速时间'}")
 print("-" * 88)
