@@ -86,16 +86,13 @@ table ip proxy_shaper {
         type filter hook prerouting priority mangle; policy accept;
         ip saddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
-        # 统计客户端上传字节
         update @client_traffic { ip saddr counter }
     }
     chain postrouting {
         type filter hook postrouting priority mangle; policy accept;
         ip daddr { 127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return;
         $ssh_port_rules
-        # 统计发给客户端的下载字节
         update @client_traffic { ip daddr counter }
-        # 如果目标属于被惩罚客户端，打上 0x20 标记直接压制出口带宽
         ip daddr @penalty_set meta mark set 0x20
     }
 }
@@ -132,7 +129,7 @@ status_file = os.environ.get("STATUS_FILE", "/run/proxy-shaper-status.json")
 
 history = {}     # ip -> list of [timestamp, bytes]
 penalties = {}   # ip -> expire_timestamp
-last_sample = {} # ip -> [last_time, last_bytes] 用于计算实时速率
+last_sample = {} # ip -> [last_time, last_bytes]
 
 def run_cmd(cmd):
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -164,13 +161,11 @@ while True:
     for ip in expired_ips:
         del penalties[ip]
         penalties_changed = True
-        # 重置滑动窗口基准，避免解封瞬间因历史残余立即二次触发
         if ip in current_traffic:
             history[ip] = [[now, current_traffic[ip]]]
 
     # 2. 遍历流量，滚动窗口计算
     for ip, total_b in current_traffic.items():
-        # 计算即时网速 (Mbps)
         cur_rate_mbps = 0.0
         if ip in last_sample:
             dt = now - last_sample[ip][0]
@@ -179,17 +174,14 @@ while True:
                 cur_rate_mbps = round((db * 8) / (dt * 1000 * 1000), 2)
         last_sample[ip] = [now, total_b]
 
-        # 记录历史采样点
         if ip not in history:
             history[ip] = [[now, total_b]]
         else:
             history[ip].append([now, total_b])
 
-        # 剔除窗口 (5分钟) 之前的旧采样点
         cutoff = now - window_sec
         history[ip] = [pt for pt in history[ip] if pt[0] >= cutoff]
 
-        # 如果剔除后没有更早的采样点，补一个作为基准点
         if len(history[ip]) == 1:
             delta_b = 0
         else:
@@ -203,23 +195,23 @@ while True:
 
         is_penalized = ip in penalties
         rem = int(penalties[ip] - now) if is_penalized else 0
-        
-        status_list.append({
-            "ip": ip,
-            "window_mb": round(delta_b / 1024 / 1024, 2),
-            "cur_rate_mbps": cur_rate_mbps,
-            "is_penalized": is_penalized,
-            "remaining_sec": rem
-        })
+        window_mb = round(delta_b / 1024 / 1024, 2)
 
-    # 同步状态到 nftables 集合
+        # 过滤规则：只有当 5 分钟流量 >= 1.0 MB 或者当前已被限速时，才加入展示列表
+        if window_mb >= 1.0 or is_penalized:
+            status_list.append({
+                "ip": ip,
+                "window_mb": window_mb,
+                "cur_rate_mbps": cur_rate_mbps,
+                "is_penalized": is_penalized,
+                "remaining_sec": rem
+            })
+
     if penalties_changed:
         sync_nft_penalty(list(penalties.keys()))
 
-    # 按 5 分钟流量倒序排序
     status_list.sort(key=lambda x: x["window_mb"], reverse=True)
 
-    # 导出快照
     try:
         with open(status_file, "w") as f:
             json.dump({
@@ -260,7 +252,7 @@ print("-" * 88)
 
 clients = data.get("clients", [])
 if not clients:
-    print("当前暂无连接记录。")
+    print("当前暂无活跃流量记录 (已自动过滤 < 1.0 MB 的空闲 IP)。")
 else:
     for c in clients:
         status_str = f"已限速 ({data['penalty_speed']})" if c["is_penalized"] else "正常 (全速)"
