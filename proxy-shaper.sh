@@ -197,7 +197,7 @@ while True:
         rem = int(penalties[ip] - now) if is_penalized else 0
         window_mb = round(delta_b / 1024 / 1024, 2)
 
-        # 过滤规则：只有当 5 分钟流量 >= 1.0 MB 或者当前已被限速时，才加入展示列表
+        # 过滤规则：只有 5 分钟流量 >= 1.0 MB 或处于受罚状态时才加入面板
         if window_mb >= 1.0 or is_penalized:
             status_list.append({
                 "ip": ip,
@@ -207,11 +207,26 @@ while True:
                 "remaining_sec": rem
             })
 
+    # 同步状态到 nftables 集合
     if penalties_changed:
         sync_nft_penalty(list(penalties.keys()))
 
+    # 按 5 分钟流量倒序排序
     status_list.sort(key=lambda x: x["window_mb"], reverse=True)
 
+    # 3. 内存回收：清理超 20 分钟无流量增长且未受罚的非活跃 IP
+    inactive_ips = []
+    for ip, pts in list(history.items()):
+        if ip not in penalties:
+            # 最新采样点距今超 20 分钟，或 20 分钟内流量增长为 0
+            if pts and (now - pts[-1][0] > 1200 or (len(pts) > 1 and pts[-1][1] == pts[0][1] and now - pts[0][0] > 1200)):
+                inactive_ips.append(ip)
+
+    for ip in inactive_ips:
+        history.pop(ip, None)
+        last_sample.pop(ip, None)
+
+    # 4. 导出快照
     try:
         with open(status_file, "w") as f:
             json.dump({
