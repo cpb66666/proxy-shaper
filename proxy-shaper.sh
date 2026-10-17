@@ -170,13 +170,12 @@ while True:
     current_traffic = get_traffic()
     status_list = []
 
-    # 1. 检查并清理过期的限速 IP，解封并销毁其专属队列
+# 1. 检查并清理过期的限速 IP，解封并销毁其专属队列
     expired_ips = [ip for ip, info in penalties.items() if now >= info["until"]]
     for ip in expired_ips:
         cid = penalties[ip]["class_id"]
-        run_cmd(f"tc filter del dev {iface} parent 1:0 protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{cid} 2>/dev/null")
+        run_cmd(f"tc filter del dev {iface} parent 1:0 protocol ip prio 1 handle {cid} u32 2>/dev/null")
         run_cmd(f"tc qdisc del dev {iface} parent 1:{cid} 2>/dev/null")
-        run_cmd(f"tc class del dev {iface} parent 1: classid 1:{cid} 2>/dev/null")
         free_class_ids.add(cid)
         del penalties[ip]
         if ip in current_traffic:
@@ -204,14 +203,14 @@ while True:
         oldest_b = history[ip][0][1]
         delta_b = max(0, total_b - oldest_b)
 
-        # 触发限速：分配独占 classid，并使用完全等于 penalty_speed 的保障速率 + 峰值速率
+# 触发限速：分配独占 classid
         if delta_b >= threshold_bytes and ip not in penalties:
             if free_class_ids:
                 cid = free_class_ids.pop()
                 penalties[ip] = {"until": now + penalty_duration, "class_id": cid}
                 run_cmd(f"tc class add dev {iface} parent 1: classid 1:{cid} htb rate {penalty_speed} ceil {penalty_speed} burst 15k")
                 run_cmd(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: fq_codel")
-                run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{cid}")
+                run_cmd(f"tc filter add dev {iface} parent 1:0 protocol ip prio 1 handle {cid} u32 match ip dst {ip}/32 flowid 1:{cid}")
 
         is_penalized = ip in penalties
         rem = int(penalties[ip]["until"] - now) if is_penalized else 0
